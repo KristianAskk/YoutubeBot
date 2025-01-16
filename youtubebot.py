@@ -1,17 +1,13 @@
-#!/usr/bin/env python3
-import re
-
-import discord
-from discord.ext import commands
-import yt_dlp
-import urllib
-import asyncio
-import threading
 import os
-import shutil
 import sys
-import subprocess as sp
+import shutil
+import asyncio
+import discord
+import yt_dlp
+from discord.ext import commands
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+import re
 
 load_dotenv()
 TOKEN = os.getenv('BOT_TOKEN')
@@ -20,209 +16,277 @@ YTDL_FORMAT = os.getenv('YTDL_FORMAT', 'worstaudio')
 PRINT_STACK_TRACE = os.getenv('PRINT_STACK_TRACE', '1').lower() in ('true', 't', '1')
 BOT_REPORT_COMMAND_NOT_FOUND = os.getenv('BOT_REPORT_COMMAND_NOT_FOUND', '1').lower() in ('true', 't', '1')
 BOT_REPORT_DL_ERROR = os.getenv('BOT_REPORT_DL_ERROR', '0').lower() in ('true', 't', '1')
+
 try:
     COLOR = int(os.getenv('BOT_COLOR', 'ff0000'), 16)
 except ValueError:
-    print('the BOT_COLOR in .env is not a valid hex color')
-    print('using default color ff0000')
+    print('the BOT_COLOR in .env is not a valid hex color, using default ff0000')
     COLOR = 0xff0000
 
-bot = commands.Bot(command_prefix=PREFIX, intents=discord.Intents(voice_states=True, guilds=True, guild_messages=True, message_content=True))
-queues = {} # {server_id: 'queue': [(vid_file, info), ...], 'loop': bool}
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+intents.guilds = True
 
-def main():
-    if TOKEN is None:
-        return ("no token provided. Please create a .env file containing the token.\n"
-                "for more information view the README.md")
-    try: bot.run(TOKEN)
-    except discord.PrivilegedIntentsRequired as error:
-        return error
+bot = commands.Bot(command_prefix=PREFIX, intents=intents)
 
-@bot.command(name='queue', aliases=['q'])
-async def queue(ctx: commands.Context, *args):
-    try: queue = queues[ctx.guild.id]['queue']
-    except KeyError: queue = None
-    if queue == None:
-        await ctx.send('the bot isn\'t playing anything')
-    else:
-        title_str = lambda val: '‣ %s\n\n' % val[1] if val[0] == 0 else '**%2d:** %s\n' % val
-        queue_str = ''.join(map(title_str, enumerate([i[1]["title"] for i in queue])))
-        embedVar = discord.Embed(color=COLOR)
-        embedVar.add_field(name='Now playing:', value=queue_str)
-        await ctx.send(embed=embedVar)
-    if not await sense_checks(ctx):
+class GuildAudioState:
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.voice_client: discord.VoiceClient = None
+        self.loop = False
+        self.now_playing = None
+
+    def is_playing(self):
+        return self.voice_client and self.voice_client.is_playing()
+
+guild_states = {}
+
+thread_pool = ThreadPoolExecutor(max_workers=2)
+
+async def download_audio(server_id: int, query: str):
+    """
+    Download audio for `query` into ./dl/{server_id} using yt_dlp,
+    returning (local_path, info_dict).
+    """
+    ydl_opts = {
+        'format': YTDL_FORMAT,
+        'source_address': '0.0.0.0',
+        'default_search': 'ytsearch',
+        'outtmpl': '%(id)s.%(ext)s',
+        'noplaylist': True,
+        'allow_playlist_files': False,
+        'paths': {'home': f'./dl/{server_id}'},
+    }
+
+    def _blocking_download():
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+            if 'entries' in info:
+                info = info['entries'][0]
+            ydl.download([info['webpage_url']])
+            return info
+
+    loop = asyncio.get_running_loop()
+    info = await loop.run_in_executor(thread_pool, _blocking_download)
+    local_path = f'./dl/{server_id}/{info["id"]}.{info["ext"]}'
+    return local_path, info
+
+
+def after_play(error, guild_id, last_track):
+    """
+    This is called by `voice_client.play(..., after=...)` when the track finishes or errors out.
+    We schedule the next track on the event loop (do not block).
+    """
+    if error:
+        print(f"Playback error in guild {guild_id}: {error}", file=sys.stderr)
+
+    # Schedule the next track
+    bot.loop.call_soon_threadsafe(lambda: asyncio.create_task(next_track(guild_id, last_track)))
+
+
+async def next_track(guild_id: int, last_track):
+    """
+    Called after a track finishes. Checks if we should loop the old track,
+    then pops a new track from the queue and plays it.
+    """
+    state = guild_states.get(guild_id)
+    if not state or not state.voice_client:
         return
 
-@bot.command(name='skip', aliases=['s'])
-async def skip(ctx: commands.Context, *args):
-    try: queue_length = len(queues[ctx.guild.id]['queue'])
-    except KeyError: queue_length = 0
-    if queue_length <= 0:
-        await ctx.send('the bot isn\'t playing anything')
-    if not await sense_checks(ctx):
+    # If loop is on, re-queue the last track
+    if state.loop and last_track:
+        # Put it back to the queue
+        await state.queue.put(last_track)
+
+    # Get next track from the queue
+    try:
+        local_path, info = state.queue.get_nowait()
+    except asyncio.QueueEmpty:
+        # No more tracks
+        state.now_playing = None
         return
 
-    try: n_skips = int(args[0])
-    except IndexError:
-        n_skips = 1
-    except ValueError:
-        if args[0] == 'all': n_skips = queue_length
-        else: n_skips = 1
-    if n_skips == 1:
-        message = 'skipping track'
-    elif n_skips < queue_length:
-        message = f'skipping `{n_skips}` of `{queue_length}` tracks'
-    else:
-        message = 'skipping all tracks'
-        n_skips = queue_length
-    await ctx.send(message)
+    state.now_playing = (local_path, info)
+    _play_audio(guild_id, local_path, info)
 
-    voice_client = get_voice_client_from_channel_id(ctx.author.voice.channel.id)
-    for _ in range(n_skips - 1):
-        queues[ctx.guild.id]['queue'].pop(0)
-    voice_client.stop()
+
+def _play_audio(guild_id: int, local_path: str, info: dict):
+    """
+    Internal helper to actually play audio with a callback.
+    """
+    state = guild_states[guild_id]
+    vc = state.voice_client
+    if not vc or not vc.is_connected():
+        return
+
+    vc.play(
+        discord.FFmpegOpusAudio(local_path),
+        after=lambda err: after_play(err, guild_id, (local_path, info))
+    )
+
 
 @bot.command(name='play', aliases=['p'])
-async def play(ctx: commands.Context, *args):
+async def play_cmd(ctx: commands.Context, *, query: str):
+    """
+    Enqueue a URL or search term for playback. If nothing is playing, start it immediately.
+    """
     voice_state = ctx.author.voice
-    if not await sense_checks(ctx, voice_state=voice_state):
-        return
+    if not voice_state or not voice_state.channel:
+        return await ctx.send("You are not in a voice channel!")
 
-    query = ' '.join(args)
-    # this is how it's determined if the url is valid (i.e. whether to search or not) under the hood of yt-dlp
-    will_need_search = not urllib.parse.urlparse(query).scheme
+    guild_id = ctx.guild.id
 
-    server_id = ctx.guild.id
+    if guild_id not in guild_states:
+        guild_states[guild_id] = GuildAudioState()
+    state = guild_states[guild_id]
 
-    # source address as 0.0.0.0 to force ipv4 because ipv6 breaks it for some reason
-    # this is equivalent to --force-ipv4 (line 312 of https://github.com/yt-dlp/yt-dlp/blob/master/yt_dlp/options.py)
-    await ctx.send(f'looking for `{query}`...')
-    with yt_dlp.YoutubeDL({'format': YTDL_FORMAT,
-                           'source_address': '0.0.0.0',
-                           'default_search': 'ytsearch',
-                           'outtmpl': '%(id)s.%(ext)s',
-                           'noplaylist': True,
-                           'allow_playlist_files': False,
-                           # 'progress_hooks': [lambda info, ctx=ctx: video_progress_hook(ctx, info)],
-                           # 'match_filter': lambda info, incomplete, will_need_search=will_need_search, ctx=ctx: start_hook(ctx, info, incomplete, will_need_search),
-                           'paths': {'home': f'./dl/{server_id}'}}) as ydl:
+    if not state.voice_client or not state.voice_client.is_connected():
         try:
-            info = ydl.extract_info(query, download=False)
-        except yt_dlp.utils.DownloadError as err:
-            await notify_about_failure(ctx, err)
-            return
+            state.voice_client = await voice_state.channel.connect()
+        except discord.ClientException:
+            state.voice_client = get_voice_client_from_channel_id(voice_state.channel.id)
 
-        if 'entries' in info:
-            info = info['entries'][0]
-        # send link if it was a search, otherwise send title as sending link again would clutter chat with previews
-        await ctx.send('downloading ' + (f'https://youtu.be/{info["id"]}' if will_need_search else f'`{info["title"]}`'))
-        try:
-            ydl.download([query])
-        except yt_dlp.utils.DownloadError as err:
-            await notify_about_failure(ctx, err)
-            return
-        path = f'./dl/{server_id}/{info["id"]}.{info["ext"]}'
-        try:
-            queues[server_id]['queue'].append((path, info))
-        except KeyError: # first in queue
-            queues[server_id] = {'queue': [(path, info)], 'loop': False}
-            try: connection = await voice_state.channel.connect()
-            except discord.ClientException: connection = get_voice_client_from_channel_id(voice_state.channel.id)
-            connection.play(discord.FFmpegOpusAudio(path), after=lambda error=None, connection=connection, server_id=server_id:
-                                                             after_track(error, connection, server_id))
+    await ctx.send(f"Downloading `{query}`...")
 
-@bot.command('loop', aliases=['l'])
-async def loop(ctx: commands.Context, *args):
-    if not await sense_checks(ctx):
-        return
     try:
-        loop = queues[ctx.guild.id]['loop']
-    except KeyError:
-        await ctx.send('the bot isn\'t playing anything')
-        return
-    queues[ctx.guild.id]['loop'] = not loop
-
-    await ctx.send('looping is now ' + ('on' if not loop else 'off'))
-
-def get_voice_client_from_channel_id(channel_id: int):
-    for voice_client in bot.voice_clients:
-        if voice_client.channel.id == channel_id:
-            return voice_client
-
-def after_track(error, connection, server_id):
-    if error is not None:
-        print(error)
-    try:
-        last_video_path = queues[server_id]['queue'][0][0]
-        if not queues[server_id]['loop']:
-            os.remove(last_video_path)
-            queues[server_id]['queue'].pop(0)
-    except KeyError: return # probably got disconnected
-    if last_video_path not in [i[0] for i in queues[server_id]['queue']]: # check that the same video isn't queued multiple times
-        try: os.remove(last_video_path)
-        except FileNotFoundError: pass
-    try: connection.play(discord.FFmpegOpusAudio(queues[server_id]['queue'][0][0]), after=lambda error=None, connection=connection, server_id=server_id:
-                                                                          after_track(error, connection, server_id))
-    except IndexError: # that was the last item in queue
-        queues.pop(server_id) # directory will be deleted on disconnect
-        asyncio.run_coroutine_threadsafe(safe_disconnect(connection), bot.loop).result()
-
-async def safe_disconnect(connection):
-    if not connection.is_playing():
-        await connection.disconnect()
-
-async def sense_checks(ctx: commands.Context, voice_state=None) -> bool:
-    if voice_state is None: voice_state = ctx.author.voice
-    if voice_state is None:
-        await ctx.send('you have to be in a voice channel to use this command')
-        return False
-
-    if bot.user.id not in [member.id for member in ctx.author.voice.channel.members] and ctx.guild.id in queues.keys():
-        await ctx.send('you have to be in the same voice channel as the bot to use this command')
-        return False
-    return True
-
-@bot.event
-async def on_voice_state_update(member: discord.User, before: discord.VoiceState, after: discord.VoiceState):
-    if member != bot.user:
-        return
-    if before.channel is None and after.channel is not None: # joined vc
-        return
-    if before.channel is not None and after.channel is None: # disconnected from vc
-        # clean up
-        server_id = before.channel.guild.id
-        try: queues.pop(server_id)
-        except KeyError: pass
-        try: shutil.rmtree(f'./dl/{server_id}/')
-        except FileNotFoundError: pass
-
-@bot.event
-async def on_command_error(ctx: discord.ext.commands.Context, err: discord.ext.commands.CommandError):
-    # now we can handle command errors
-    if isinstance(err, discord.ext.commands.errors.CommandNotFound):
-        if BOT_REPORT_COMMAND_NOT_FOUND:
-            await ctx.send("command not recognized. To see available commands type {}help".format(PREFIX))
+        local_path, info = await download_audio(guild_id, query)
+    except yt_dlp.utils.DownloadError as err:
+        await ctx.send(f"Failed to download: {err}")
         return
 
-    # we ran out of handlable exceptions, re-start. type_ and value are None for these
-    sys.stderr.write(f'unhandled command error raised, {err=}')
-    sys.stderr.flush()
-    sp.run(['./restart'])
+    title = info.get("title", "Unknown Title")
+    await ctx.send(f"Queued: **{title}**")
+
+    await state.queue.put((local_path, info))
+
+    if not state.is_playing():
+        await next_track(guild_id, None)
+
+
+@bot.command(name='skip', aliases=['s'])
+async def skip_cmd(ctx: commands.Context):
+    """
+    Skip the current track.
+    """
+    guild_id = ctx.guild.id
+    voice_state = ctx.author.voice
+    if not voice_state or not voice_state.channel:
+        return await ctx.send("You are not in a voice channel!")
+
+    state = guild_states.get(guild_id)
+    if not state or not state.voice_client:
+        return await ctx.send("Nothing is playing.")
+
+    if state.voice_client.is_playing():
+        state.voice_client.stop()
+        await ctx.send("Skipped current track.")
+    else:
+        await ctx.send("No audio is playing at the moment.")
+
+
+@bot.command(name='queue', aliases=['q'])
+async def queue_cmd(ctx: commands.Context):
+    """
+    List queued items (not including what’s currently playing).
+    """
+    state = guild_states.get(ctx.guild.id)
+    if not state:
+        return await ctx.send("No queue for this server.")
+
+    queued_items = list(state.queue._queue)
+    if not queued_items:
+        return await ctx.send("Queue is empty.")
+
+    desc = ""
+    for i, (_, info) in enumerate(queued_items, start=1):
+        desc += f"{i}. {info.get('title', '???')}\n"
+
+    now_playing = state.now_playing[1].get('title') if state.now_playing else None
+    embed = discord.Embed(title="Current Queue", description=desc, color=COLOR)
+    if now_playing:
+        embed.add_field(name="Now Playing", value=now_playing, inline=False)
+
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='loop')
+async def loop_cmd(ctx: commands.Context):
+    """
+    Toggle loop on/off. If on, the currently playing track is re-inserted
+    to the end of the queue each time it finishes.
+    """
+    state = guild_states.get(ctx.guild.id)
+    if not state:
+        return await ctx.send("No queue in this server. Try playing something first.")
+
+    state.loop = not state.loop
+    await ctx.send(f"Looping is now set to: {state.loop}")
+
+
+@bot.command(name='stop')
+async def stop_cmd(ctx: commands.Context):
+    """
+    Stop playing and clear the queue. Bot remains connected, though.
+    """
+    guild_id = ctx.guild.id
+    state = guild_states.get(guild_id)
+    if not state:
+        return await ctx.send("Nothing to stop here.")
+
+    if state.voice_client and state.voice_client.is_playing():
+        state.voice_client.stop()
+
+    while not state.queue.empty():
+        state.queue.get_nowait()
+
+    state.now_playing = None
+    await ctx.send("Playback stopped and queue cleared.")
 
 @bot.event
 async def on_ready():
-    print(f'logged in successfully as {bot.user.name}')
-async def notify_about_failure(ctx: commands.Context, err: yt_dlp.utils.DownloadError):
-    if BOT_REPORT_DL_ERROR:
-        # remove shell colors for discord message
-        sanitized = re.compile(r'\x1b[^m]*m').sub('', err.msg).strip()
-        if sanitized[0:5].lower() == "error":
-            # if message starts with error, strip it to avoid being redundant
-            sanitized = sanitized[5:].strip(" :")
-        await ctx.send('failed to download due to error: {}'.format(sanitized))
+    print(f"Logged in as {bot.user.name}")
+
+@bot.event
+async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+    """
+    If the bot leaves or is kicked from a channel, clean up the server's queue dir.
+    """
+    if member != bot.user:
+        return
+
+    # Bot was disconnected
+    if before.channel is not None and after.channel is None:
+        server_id = before.channel.guild.id
+        if server_id in guild_states:
+            try:
+                shutil.rmtree(f'./dl/{server_id}/')
+            except FileNotFoundError:
+                pass
+            guild_states.pop(server_id, None)
+
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        if BOT_REPORT_COMMAND_NOT_FOUND:
+            await ctx.send(f"Command not recognized. Type `{PREFIX}help` to see available commands.")
     else:
-        await ctx.send('sorry, failed to download this video')
-    return
+        if PRINT_STACK_TRACE:
+            raise error
+        else:
+            print(f"Unhandled command error: {error}", file=sys.stderr)
+
+def get_voice_client_from_channel_id(channel_id: int):
+    for vc in bot.voice_clients:
+        if vc.channel and vc.channel.id == channel_id:
+            return vc
+
+def main():
+    if not TOKEN:
+        print("No token provided. Please set BOT_TOKEN=... in your .env file.")
+        return 1
+    bot.run(TOKEN)
 
 if __name__ == '__main__':
     try:

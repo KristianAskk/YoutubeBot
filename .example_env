@@ -1,4 +1,4 @@
-BOT_TOKEN=your_token_goes_here
+BOT_TOKEN=TOKEN
 BOT_PREFIX=.
 BOT_COLOR=ff0000
 YTDL_FORMAT=worstaudio
